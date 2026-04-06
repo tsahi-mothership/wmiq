@@ -62,18 +62,25 @@ pub fn build_wql(class: &str, columns: &[&str], filter: Option<&str>, extra_wher
 }
 
 /// Execute a raw WQL query and return results as Vec<HashMap<String, Variant>>.
+///
+/// Uses the async WMI API (`ExecQueryAsync`) via a tokio runtime to avoid
+/// deadlocks that can occur with the semi-synchronous `ExecQuery` + enumerator
+/// pattern when COM apartment threading conflicts with the calling environment.
 pub fn exec_wql(namespace: &str, wql: &str) -> Result<Vec<HashMap<String, Variant>>> {
-    let com = COMLibrary::new().context("Failed to initialize COM library")?;
-    let conn = if namespace == "root\\cimv2" || namespace == r"root\cimv2" {
-        WMIConnection::new(com).context("Failed to connect to WMI (root\\cimv2)")?
-    } else {
-        WMIConnection::with_namespace_path(namespace, com)
-            .context(format!("Failed to connect to WMI namespace: {}", namespace))?
-    };
+    let com = COMLibrary::without_security().context("Failed to initialize COM library")?;
+    let conn = WMIConnection::with_namespace_path(namespace, com)
+        .context(format!("Failed to connect to WMI namespace: {}", namespace))?;
 
-    let results: Vec<HashMap<String, Variant>> = conn
-        .raw_query(wql)
-        .context(format!("WQL query failed: {}", wql))?;
+    let wql = wql.to_owned();
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("Failed to create async runtime")?;
+
+    let results: Vec<HashMap<String, Variant>> = rt.block_on(async {
+        conn.async_raw_query(&wql).await
+    }).context(format!("WQL query failed: {}", wql))?;
 
     Ok(results)
 }
